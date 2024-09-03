@@ -626,6 +626,7 @@ func (t *Trie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) {
 		}
 		return types.EmptyRootHash, nodes // case (b)
 	}
+	unhashed := t.unhashed
 	// Derive the hash for all dirty nodes first. We hold the assumption
 	// in the following procedure that all nodes are hashed.
 	rootHash := t.Hash()
@@ -642,7 +643,7 @@ func (t *Trie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) {
 	for _, path := range t.tracer.deletedNodes() {
 		nodes.AddNode([]byte(path), trienode.NewDeleted())
 	}
-	t.root = newCommitter(nodes, t.tracer, collectLeaf).Commit(t.root)
+	t.root = newCommitter(nodes, t.tracer, collectLeaf, unhashed >= 100).Commit(t.root)
 	return rootHash, nodes
 }
 

@@ -18,6 +18,8 @@ package trie
 
 import (
 	"fmt"
+	"sync"
+	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/trie/trienode"
@@ -30,20 +32,64 @@ type committer struct {
 	nodes       *trienode.NodeSet
 	tracer      *tracer
 	collectLeaf bool
+	parallel    bool
+	recorder    *commitRecorder
+}
+
+type commitNode struct {
+	isLeaf bool
+	path   []byte
+	node   *trienode.Node
+}
+
+type commitRecorder struct {
+	nodeCh       chan *commitNode
+	done         chan struct{}
+	commitCount  atomic.Int64
+	collectCount atomic.Int64
 }
 
 // newCommitter creates a new committer or picks one from the pool.
-func newCommitter(nodeset *trienode.NodeSet, tracer *tracer, collectLeaf bool) *committer {
+func newCommitter(nodeset *trienode.NodeSet, tracer *tracer, collectLeaf bool, parallel bool) *committer {
 	return &committer{
 		nodes:       nodeset,
 		tracer:      tracer,
 		collectLeaf: collectLeaf,
+		parallel:    parallel,
+		recorder: &commitRecorder{
+			nodeCh: make(chan *commitNode, 16),
+			done:   make(chan struct{}),
+		},
+	}
+}
+
+func (c *committer) CollectNodes() {
+	for {
+		select {
+		case n := <-c.recorder.nodeCh:
+			if n.isLeaf {
+				c.nodes.AddLeaf(n.node.Hash, n.node.Blob)
+			} else {
+				c.nodes.AddNode(n.path, n.node)
+			}
+			c.recorder.collectCount.Add(1)
+		case <-c.recorder.done:
+			return
+		}
 	}
 }
 
 // Commit collapses a node down into a hash node.
 func (c *committer) Commit(n node) hashNode {
-	return c.commit(nil, n).(hashNode)
+	go c.CollectNodes()
+	hashNode := c.commit(nil, n).(hashNode)
+	for {
+		if c.recorder.collectCount.Load() == c.recorder.commitCount.Load() {
+			close(c.recorder.done)
+			break
+		}
+	}
+	return hashNode
 }
 
 // commit collapses a node down into a hash node and returns it.
@@ -93,23 +139,41 @@ func (c *committer) commit(path []byte, n node) node {
 // commitChildren commits the children of the given fullnode
 func (c *committer) commitChildren(path []byte, n *fullNode) [17]node {
 	var children [17]node
+	var wg sync.WaitGroup
 	for i := 0; i < 16; i++ {
 		child := n.Children[i]
 		if child == nil {
 			continue
 		}
-		// If it's the hashed child, save the hash value directly.
-		// Note: it's impossible that the child in range [0, 15]
-		// is a valueNode.
-		if hn, ok := child.(hashNode); ok {
-			children[i] = hn
-			continue
+		var commitChild = func(i int) {
+			// If it's the hashed child, save the hash value directly.
+			// Note: it's impossible that the child in range [0, 15]
+			// is a valueNode.
+			if hn, ok := child.(hashNode); ok {
+				children[i] = hn
+				return
+			}
+			// Commit the child recursively and store the "hashed" value.
+			// Note the returned node can be some embedded nodes, so it's
+			// possible the type is not hashNode.
+			// fmt.Println("commitChildren parent uuid: ", uuid, " path: ", path)
+			newPath := make([]byte, len(path))
+			copy(newPath, path)
+			newPath = append(newPath, byte(i))
+			children[i] = c.commit(newPath, child)
 		}
-		// Commit the child recursively and store the "hashed" value.
-		// Note the returned node can be some embedded nodes, so it's
-		// possible the type is not hashNode.
-		children[i] = c.commit(append(path, byte(i)), child)
+		if c.parallel {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				commitChild(i)
+			}(i)
+		} else {
+			commitChild(i)
+		}
 	}
+	wg.Wait()
+
 	// For the 17th child, it's possible the type is valuenode.
 	if n.Children[16] != nil {
 		children[16] = n.Children[16]
@@ -133,13 +197,15 @@ func (c *committer) store(path []byte, n node) node {
 		// deleted only if the node was existent in database before.
 		_, ok := c.tracer.accessList[string(path)]
 		if ok {
-			c.nodes.AddNode(path, trienode.NewDeleted())
+			c.recorder.nodeCh <- &commitNode{false, path, trienode.NewDeleted()}
+			c.recorder.commitCount.Add(1)
 		}
 		return n
 	}
 	// Collect the dirty node to nodeset for return.
 	nhash := common.BytesToHash(hash)
-	c.nodes.AddNode(path, trienode.New(nhash, nodeToBytes(n)))
+	c.recorder.nodeCh <- &commitNode{false, path, trienode.New(nhash, nodeToBytes(n))}
+	c.recorder.commitCount.Add(1)
 
 	// Collect the corresponding leaf node if it's required. We don't check
 	// full node since it's impossible to store value in fullNode. The key
@@ -147,7 +213,8 @@ func (c *committer) store(path []byte, n node) node {
 	if c.collectLeaf {
 		if sn, ok := n.(*shortNode); ok {
 			if val, ok := sn.Val.(valueNode); ok {
-				c.nodes.AddLeaf(nhash, val)
+				c.recorder.nodeCh <- &commitNode{true, nil, trienode.New(nhash, val)}
+				c.recorder.commitCount.Add(1)
 			}
 		}
 	}
