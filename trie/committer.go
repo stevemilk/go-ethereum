@@ -163,6 +163,7 @@ func (c *committer) commitChildren(path []byte, n *fullNode) [17]node {
 			children[i] = c.commit(newPath, child)
 		}
 		if c.parallel {
+			c.parallel = false
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
